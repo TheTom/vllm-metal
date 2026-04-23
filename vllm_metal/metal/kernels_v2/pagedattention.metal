@@ -1119,6 +1119,13 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
     for (int tok = 0; tok < block_valid_tokens; tok++) {
       const float score = warp_scores[tok];
       const float w = exp(score - warp_m);
+
+      // TQ+ Sparse V: skip V dequant+accumulate for negligible attention
+      // weights. At 32K context, 90%+ of weights fall below threshold.
+      // Zero PPL loss, +22.8% decode throughput at long context.
+      // See: TheTom/turboquant_plus/docs/papers/sparse-v-dequant.md
+      if (w < 1e-6f) continue;
+
       warp_l += w;
 
       // Load V and accumulate: O += w * V

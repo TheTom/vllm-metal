@@ -81,12 +81,39 @@ def searchsorted(boundaries, x):
 _FWHT_SUPPORTED_DIMS = (64, 128, 256)
 
 
+def _next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 >= n."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def padded_head_dim(head_dim: int) -> int:
+    """Return the FWHT-compatible dimension for a given head_dim.
+
+    Non-power-of-2 head dims (e.g. 80, 96) are padded to the next
+    power of 2 that has a Metal sign table. Padding is zero-filled
+    before rotation and sliced after inverse — mathematically lossless.
+    """
+    if head_dim in _FWHT_SUPPORTED_DIMS:
+        return head_dim
+    p = _next_power_of_2(head_dim)
+    if p not in _FWHT_SUPPORTED_DIMS:
+        raise ValueError(
+            f"head_dim={head_dim} pads to {p} which is not in "
+            f"{_FWHT_SUPPORTED_DIMS}. Metal kernel needs sign tables for this size."
+        )
+    return p
+
+
 def fwht(x: mx.array, encode: bool) -> mx.array:
     dim = x.shape[-1]
     if dim not in _FWHT_SUPPORTED_DIMS:
         raise ValueError(
             f"FWHT only supports head_dim in {_FWHT_SUPPORTED_DIMS}, got {dim}. "
-            "The Metal kernel has hardcoded sign tables only for these sizes."
+            "The Metal kernel has hardcoded sign tables only for these sizes. "
+            "Use padded_head_dim() to pad non-power-of-2 head dims first."
         )
     sign01 = mx.random.randint(0, 2, shape=(dim,), key=_RNG_KEY)
     signs = 1 - 2 * sign01
@@ -452,15 +479,23 @@ def turbo_quant_encode_value(x: mx.array, bits: int = 3) -> tuple[mx.array, mx.a
 
     Args:
         x:    Input tensor. Last dim must be a power of two (FWHT) and divisible
-              by BLOCK_SIZE (Lloyd-Max scale grouping).
+              by BLOCK_SIZE (Lloyd-Max scale grouping), OR a non-power-of-2 dim
+              that pads to a supported FWHT size (e.g. 80 → 128).
         bits: Target bit width. 3 uses the precomputed lookup (fast path, also
               what the Metal kernel consumes); other widths compute centroids
               dynamically via Lloyd-Max.
 
     Returns:
         (indices, scale). ``indices`` are uint8 values in [0, 2^bits - 1]
-        (not yet bit-packed).
+        (not yet bit-packed). If input was padded, indices/scale are in
+        padded space.
     """
+    dim = x.shape[-1]
+    pad_dim = padded_head_dim(dim) if dim not in _FWHT_SUPPORTED_DIMS else dim
+    if pad_dim > dim:
+        # Zero-pad to FWHT-compatible dimension
+        pad_width = [(0, 0)] * (x.ndim - 1) + [(0, pad_dim - dim)]
+        x = mx.pad(x, pad_width)
     x = fwht(x, True)
     return lm_quant(x, bits)
 
@@ -478,10 +513,18 @@ def turbo_quant_decode_value(
     output_dtype: mx.Dtype = mx.float32,
     block_size: int = 32,
     bits: int = 3,
+    original_head_dim: int = 0,
 ) -> mx.array:
-    """Decode V with Lloyd-Max dequantization and inverse FWHT."""
+    """Decode V with Lloyd-Max dequantization and inverse FWHT.
+
+    If original_head_dim is set and smaller than the indices' last dim,
+    the output is sliced back to original_head_dim after inverse FWHT
+    (undoing the padding applied during encode).
+    """
     x = lm_de_quant(indices, scale, bits=bits, block_size=block_size)
     x = fwht(x, False)
+    if original_head_dim > 0 and original_head_dim < x.shape[-1]:
+        x = x[..., :original_head_dim]
     return x.astype(output_dtype)
 
 
