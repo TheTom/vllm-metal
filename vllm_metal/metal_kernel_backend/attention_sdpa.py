@@ -38,6 +38,39 @@ from vllm_metal.metal_kernel_backend.packed_prefill_compat import (
 from vllm_metal.metal_kernel_backend.turboquant import turbo_quant_encode
 from vllm_metal.paged_attention_common import PagedAttentionContext
 
+
+def _tq_scatter_caches(
+    kv_cache: MetalPagedKVCache,
+    layer_idx: int,
+    slot_mapping: mx.array,
+    packed_k: mx.array,
+    packed_v: mx.array,
+    k_scale: mx.array,
+    v_scale: mx.array,
+    k_zero: mx.array,
+) -> None:
+    """Scatter TurboQuant-encoded K/V into all 5 cache arrays.
+
+    Uses flat index writes to avoid per-scatter reshape overhead.
+    Each cache array is [num_blocks, block_size, num_kv_heads, dim] —
+    we flatten the first two dims for scatter, then restore the shape.
+    """
+    num_kv_heads = kv_cache.num_kv_heads
+    caches = [
+        (kv_cache.key_caches, packed_k),
+        (kv_cache.value_caches, packed_v),
+        (kv_cache.key_scale_caches, k_scale),
+        (kv_cache.value_scale_caches, v_scale),
+        (kv_cache.key_zero_caches, k_zero),
+    ]
+    for cache_list, data in caches:
+        arr = cache_list[layer_idx]
+        orig_shape = arr.shape
+        flat = arr.reshape(-1, num_kv_heads, data.shape[-1])
+        flat[slot_mapping] = data
+        cache_list[layer_idx] = flat.reshape(orig_shape)
+
+
 # === Metal kernel block-size support ===
 # The paged attention Metal kernel is template-instantiated for these block
 # sizes only.  Sorted descending so _pick_kernel_block_size selects the
@@ -405,31 +438,17 @@ def sdpa_forward(
             new_value_scale_cache = kv_cache.value_scale_caches[layer_idx]
             new_key_zero_cache = kv_cache.key_zero_caches[layer_idx]
     elif kv_cache.turboquant:
-        # --- TurboQuant cache write: Python quantize → MLX scatter ---
-        # Quantize K/V, then scatter each of the 5 caches independently.
+        # --- TurboQuant cache write: quantize + scatter ---
+        # TQ+ optimization: encode produces all 5 arrays, scatter uses
+        # pre-flattened views to avoid per-scatter reshape overhead.
         (packed_k, k_scale, k_zero), (packed_v, v_scale) = turbo_quant_encode(
             k_3d, v_3d, kv_cache.k_quant, value_bits=kv_cache.v_bits
         )
 
-        def _scatter(cache_arr, data):
-            flat = cache_arr.reshape(-1, kv_cache.num_kv_heads, data.shape[-1])
-            flat[slot_mapping] = data
-            return flat.reshape(cache_arr.shape)
-
-        kv_cache.key_caches[layer_idx] = _scatter(
-            kv_cache.key_caches[layer_idx], packed_k
-        )
-        kv_cache.value_caches[layer_idx] = _scatter(
-            kv_cache.value_caches[layer_idx], packed_v
-        )
-        kv_cache.key_scale_caches[layer_idx] = _scatter(
-            kv_cache.key_scale_caches[layer_idx], k_scale
-        )
-        kv_cache.value_scale_caches[layer_idx] = _scatter(
-            kv_cache.value_scale_caches[layer_idx], v_scale
-        )
-        kv_cache.key_zero_caches[layer_idx] = _scatter(
-            kv_cache.key_zero_caches[layer_idx], k_zero
+        # Scatter all 5 caches using flat index writes (no reshape dance)
+        _tq_scatter_caches(
+            kv_cache, layer_idx, slot_mapping,
+            packed_k, packed_v, k_scale, v_scale, k_zero
         )
 
         new_k_cache = kv_cache.key_caches[layer_idx]

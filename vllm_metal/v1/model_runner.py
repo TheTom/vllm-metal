@@ -783,6 +783,8 @@ class MetalModelRunner:
                 ctx.gdn_slot_mapping = gdn_slots
 
         # ---- forward (lazy graph + async submit) ----
+        import time as _time
+        _t0 = _time.perf_counter()
         offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
         input_ids = mx.array([all_token_ids], dtype=mx.int32)
         try:
@@ -795,9 +797,20 @@ class MetalModelRunner:
             del model_output
         finally:
             clear_context()
+        _t1 = _time.perf_counter()
 
         # Submit to GPU — returns immediately, GPU runs in background
+        _t_async0 = _time.perf_counter()
         mx.async_eval(logits)
+        _t_async1 = _time.perf_counter()
+        # TQ+ timing: log graph build + async_eval time
+        if not hasattr(self, '_tq_fwd_count'):
+            self._tq_fwd_count = 0
+            self._tq_fwd_total = 0.0
+            self._tq_eval_total = 0.0
+            self._tq_async_total = 0.0
+        self._tq_graph_build = _t1 - _t0
+        self._tq_async_total += (_t_async1 - _t_async0) * 1000
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
@@ -837,7 +850,29 @@ class MetalModelRunner:
         num_decode = state.num_decode
 
         # ---- wait for MLX forward to complete ----
+        import time as _time
+        _t_eval_start = _time.perf_counter()
         mx.eval(logits)
+        _t_eval_end = _time.perf_counter()
+        # TQ+ timing instrumentation
+        if hasattr(self, '_tq_fwd_count'):
+            self._tq_fwd_count += 1
+            eval_ms = (_t_eval_end - _t_eval_start) * 1000
+            graph_ms = getattr(self, '_tq_graph_build', 0) * 1000
+            self._tq_fwd_total += graph_ms
+            self._tq_eval_total += eval_ms
+            if self._tq_fwd_count % 20 == 0:
+                avg_graph = self._tq_fwd_total / self._tq_fwd_count
+                avg_eval = self._tq_eval_total / self._tq_fwd_count
+                avg_async = self._tq_async_total / self._tq_fwd_count
+                from vllm.logger import init_logger as _il
+                _il(__name__).info(
+                    "TQ+ perf [%d steps]: graph=%.1fms async_eval=%.1fms "
+                    "gpu_eval=%.1fms total=%.1fms (%.1f tok/s ceiling)",
+                    self._tq_fwd_count, avg_graph, avg_async, avg_eval,
+                    avg_graph + avg_eval,
+                    1000.0 / (avg_graph + avg_eval) if (avg_graph + avg_eval) > 0 else 0,
+                )
 
         # ---- apply structured output bitmask if present ----
         if grammar_output is not None:
